@@ -1,0 +1,1 @@
+savedcmd_/root/driver-final/driver/crypto_chat.ko := ld -r -m elf_x86_64 -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T scripts/module.lds -o /root/driver-final/driver/crypto_chat.ko /root/driver-final/driver/crypto_chat.o /root/driver-final/driver/crypto_chat.mod.o /root/driver-final/driver/.module-common.o
