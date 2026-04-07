@@ -39,6 +39,7 @@
 #define DEFAULT_PORT  "9090"
 #define SHARED_SECRET "CryptoChatServerSecret_v1_DO_NOT_SHARE"
 #define LIST_INTERVAL_SEC 15
+#define SERVER_HISTORY_LIMIT 8
 
 /* ── Loại tin nhắn UI (nội bộ) ───────────────────────────── */
 enum {
@@ -46,7 +47,9 @@ enum {
     UI_MSG_SYSTEM,
     UI_MSG_PRIVATE,
     UI_MSG_ERROR,
-    UI_MSG_USERLIST
+    UI_MSG_USERLIST,
+    UI_MSG_PASSWD_OK,
+    UI_MSG_PASSWD_FAIL
 };
 
 /* ── Trạng thái ứng dụng ─────────────────────────────────── */
@@ -56,6 +59,8 @@ typedef struct {
     GtkWidget    *stack;
     GtkWidget    *host_entry;
     GtkWidget    *port_entry;
+    GtkListStore *host_history_store;
+    GtkListStore *port_history_store;
     GtkWidget    *user_entry;
     GtkWidget    *pass_entry;
     GtkWidget    *connect_btn;
@@ -65,6 +70,7 @@ typedef struct {
 
     /* Trang chat */
     GtkWidget    *header_bar;
+    GtkWidget    *change_pass_btn;
     GtkWidget    *logout_btn;
     GtkWidget    *chat_view;
     GtkTextBuffer*chat_buf;
@@ -89,6 +95,10 @@ typedef struct {
     int           sock;
     char          username[MAX_USERNAME_LEN];
     char          recipient[MAX_USERNAME_LEN];
+    uint8_t       current_password_hash[SHA256_DIGEST_SIZE];
+    uint8_t       pending_password_hash[SHA256_DIGEST_SIZE];
+    int           has_password_hash;
+    int           has_pending_password_hash;
     uint8_t       session_key[AES_KEY_SIZE];
     crypto_ctx_t  crypto;
     volatile int  connected;
@@ -111,16 +121,295 @@ typedef struct {
     char *text;
 } UIMsgData;
 
+typedef struct {
+    char host[256];
+    int  port;
+} ServerHistoryArgs;
+
 static int send_command(uint8_t type, const void *payload, uint16_t plain_len);
 static int recv_frame_gui(struct chat_frame *f);
 static int frame_hmac(const struct chat_frame *f, uint8_t hmac_out[SHA256_DIGEST_SIZE]);
 static void append_chat_text(const char *text, int msg_type);
+static void load_server_history(void);
+static void apply_startup_server_defaults(int argc, char *argv[]);
+static gboolean ui_remember_server_history(gpointer data);
 static gboolean ui_on_message(gpointer data);
 static gboolean ui_on_disconnect(gpointer data);
 static gboolean ui_connect_ok(gpointer data);
 static gboolean ui_connect_fail(gpointer data);
 static gboolean ui_connect_success(gpointer data);
 static void perform_logout(gboolean notify_server, const char *login_msg);
+static void on_change_password_clicked(GtkWidget *w, gpointer data);
+
+static void show_message_dialog(GtkMessageType msg_type, const char *text)
+{
+    GtkWidget *dlg = gtk_message_dialog_new(
+        GTK_WINDOW(app.window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        msg_type,
+        GTK_BUTTONS_OK,
+        "%s",
+        text ? text : "");
+    gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+}
+
+static char *get_server_history_path(const char *filename)
+{
+    return g_build_filename(g_get_user_config_dir(), "cryptochat",
+                            filename, NULL);
+}
+
+static guint list_store_count(GtkListStore *store)
+{
+    GtkTreeIter iter;
+    guint count = 0;
+
+    if (!gtk_tree_model_get_iter_first(GTK_TREE_MODEL(store), &iter))
+        return 0;
+
+    do {
+        count++;
+    } while (gtk_tree_model_iter_next(GTK_TREE_MODEL(store), &iter));
+
+    return count;
+}
+
+static gboolean list_store_has_value(GtkListStore *store, const char *value)
+{
+    GtkTreeIter iter;
+    gboolean valid;
+
+    if (!value || !*value)
+        return TRUE;
+
+    valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(store), &iter);
+    while (valid) {
+        char *current = NULL;
+
+        gtk_tree_model_get(GTK_TREE_MODEL(store), &iter, 0, &current, -1);
+        if (g_strcmp0(current, value) == 0) {
+            g_free(current);
+            return TRUE;
+        }
+        g_free(current);
+        valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(store), &iter);
+    }
+
+    return FALSE;
+}
+
+static void list_store_trim(GtkListStore *store, guint limit)
+{
+    while (list_store_count(store) > limit) {
+        GtkTreeIter iter;
+        guint last_index = list_store_count(store) - 1;
+
+        if (gtk_tree_model_iter_nth_child(GTK_TREE_MODEL(store), &iter,
+                                          NULL, last_index))
+            gtk_list_store_remove(store, &iter);
+        else
+            gtk_list_store_clear(store);
+    }
+}
+
+static void list_store_prepend_unique(GtkListStore *store, const char *value,
+                                      guint limit)
+{
+    GtkTreeIter iter;
+    gboolean valid;
+
+    if (!value || !*value)
+        return;
+
+    valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(store), &iter);
+    while (valid) {
+        char *current = NULL;
+
+        gtk_tree_model_get(GTK_TREE_MODEL(store), &iter, 0, &current, -1);
+        if (g_strcmp0(current, value) == 0) {
+            g_free(current);
+            gtk_list_store_remove(store, &iter);
+            break;
+        }
+        g_free(current);
+        valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(store), &iter);
+    }
+
+    gtk_list_store_prepend(store, &iter);
+    gtk_list_store_set(store, &iter, 0, value, -1);
+    list_store_trim(store, limit);
+}
+
+static void list_store_append_unique(GtkListStore *store, const char *value,
+                                    guint limit)
+{
+    GtkTreeIter iter;
+
+    if (!value || !*value)
+        return;
+    if (list_store_has_value(store, value))
+        return;
+    if (list_store_count(store) >= limit)
+        return;
+
+    gtk_list_store_append(store, &iter);
+    gtk_list_store_set(store, &iter, 0, value, -1);
+}
+
+static void load_history_file(GtkListStore *store, const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    char line[256];
+
+    if (!fp)
+        return;
+
+    while (fgets(line, sizeof(line), fp)) {
+        g_strchomp(line);
+        g_strstrip(line);
+        list_store_append_unique(store, line, SERVER_HISTORY_LIMIT);
+    }
+
+    fclose(fp);
+}
+
+static void save_history_file(GtkListStore *store, const char *path)
+{
+    FILE *fp;
+    GtkTreeIter iter;
+    gboolean valid;
+    char *dir = g_path_get_dirname(path);
+
+    if (!dir) return;
+    g_mkdir_with_parents(dir, 0700);
+    g_free(dir);
+
+    fp = fopen(path, "w");
+    if (!fp)
+        return;
+
+    valid = gtk_tree_model_get_iter_first(GTK_TREE_MODEL(store), &iter);
+    while (valid) {
+        char *value = NULL;
+        gtk_tree_model_get(GTK_TREE_MODEL(store), &iter, 0, &value, -1);
+        if (value && *value)
+            fprintf(fp, "%s\n", value);
+        g_free(value);
+        valid = gtk_tree_model_iter_next(GTK_TREE_MODEL(store), &iter);
+    }
+
+    fclose(fp);
+}
+
+static void init_history_completion(GtkWidget *entry, GtkListStore **store_slot,
+                                    const char *history_file)
+{
+    GtkEntryCompletion *completion;
+
+    if (!*store_slot)
+        *store_slot = gtk_list_store_new(1, G_TYPE_STRING);
+
+    load_history_file(*store_slot, history_file);
+
+    completion = gtk_entry_completion_new();
+    gtk_entry_completion_set_model(completion, GTK_TREE_MODEL(*store_slot));
+    gtk_entry_completion_set_text_column(completion, 0);
+    gtk_entry_completion_set_minimum_key_length(completion, 1);
+    gtk_entry_completion_set_popup_completion(completion, TRUE);
+    gtk_entry_set_completion(GTK_ENTRY(entry), completion);
+    g_object_unref(completion);
+}
+
+static void history_promote_value(GtkListStore *store, const char *value,
+                                  const char *history_file)
+{
+    list_store_prepend_unique(store, value, SERVER_HISTORY_LIMIT);
+    save_history_file(store, history_file);
+}
+
+static gboolean ui_remember_server_history(gpointer data)
+{
+    ServerHistoryArgs *args = data;
+    char *host_path = get_server_history_path("server_hosts.txt");
+    char *port_path = get_server_history_path("server_ports.txt");
+
+    history_promote_value(app.host_history_store, args->host, host_path);
+
+    {
+        char port_text[32];
+        snprintf(port_text, sizeof(port_text), "%d", args->port);
+        history_promote_value(app.port_history_store, port_text, port_path);
+    }
+
+    g_free(host_path);
+    g_free(port_path);
+    g_free(args);
+    return G_SOURCE_REMOVE;
+}
+
+static void queue_server_history(const char *host, int port)
+{
+    ServerHistoryArgs *args = g_new0(ServerHistoryArgs, 1);
+    snprintf(args->host, sizeof(args->host), "%s",
+             host && *host ? host : DEFAULT_HOST);
+    args->port = port > 0 ? port : atoi(DEFAULT_PORT);
+    g_idle_add(ui_remember_server_history, args);
+}
+
+static void load_server_history(void)
+{
+    char *host_path;
+    char *port_path;
+
+    if (app.host_entry) {
+        host_path = get_server_history_path("server_hosts.txt");
+        init_history_completion(app.host_entry, &app.host_history_store,
+                                host_path);
+        g_free(host_path);
+    }
+    if (app.port_entry) {
+        port_path = get_server_history_path("server_ports.txt");
+        init_history_completion(app.port_entry, &app.port_history_store,
+                                port_path);
+        g_free(port_path);
+    }
+}
+
+static void apply_startup_server_defaults(int argc, char *argv[])
+{
+    const char *host = NULL;
+    const char *port = NULL;
+    char *host_copy = NULL;
+    char *port_copy = NULL;
+
+    if (argc >= 2)
+        host = argv[1];
+    if (argc >= 3)
+        port = argv[2];
+
+    if (!host && app.host_history_store) {
+        GtkTreeIter iter;
+        if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(app.host_history_store), &iter)) {
+            gtk_tree_model_get(GTK_TREE_MODEL(app.host_history_store), &iter, 0, &host_copy, -1);
+            host = host_copy;
+        }
+    }
+
+    if (!port && app.port_history_store) {
+        GtkTreeIter iter;
+        if (gtk_tree_model_get_iter_first(GTK_TREE_MODEL(app.port_history_store), &iter)) {
+            gtk_tree_model_get(GTK_TREE_MODEL(app.port_history_store), &iter, 0, &port_copy, -1);
+            port = port_copy;
+        }
+    }
+
+    gtk_entry_set_text(GTK_ENTRY(app.host_entry), host ? host : DEFAULT_HOST);
+    gtk_entry_set_text(GTK_ENTRY(app.port_entry), port ? port : DEFAULT_PORT);
+
+    g_free(host_copy);
+    g_free(port_copy);
+}
 
 /* ── CSS theme ─────────────────────────────────────────────
  *
@@ -511,7 +800,11 @@ static void *recv_thread_func(void *data)
         char *text = (char *)plain;
 
         int msg_type = UI_MSG_NORMAL;
-        if (strncmp(text, "***", 3) == 0)
+        if (f.type == MSG_TYPE_PASSWD_CHANGE_OK)
+            msg_type = UI_MSG_PASSWD_OK;
+        else if (f.type == MSG_TYPE_PASSWD_CHANGE_FAIL)
+            msg_type = UI_MSG_PASSWD_FAIL;
+        else if (strncmp(text, "***", 3) == 0)
             msg_type = UI_MSG_SYSTEM;
         else if (strncmp(text, "Online users:", 13) == 0)
             msg_type = UI_MSG_USERLIST;
@@ -774,6 +1067,8 @@ static int do_auth(const char *username, const char *password)
                           app.session_key) < 0)
         return -1;
 
+    memcpy(app.current_password_hash, ap.password_hash, SHA256_DIGEST_SIZE);
+    app.has_password_hash = 1;
     snprintf(app.username, sizeof(app.username), "%s", username);
     return 0;
 }
@@ -837,6 +1132,8 @@ static void *connect_thread_func(void *data)
 
     app.connected = 1;
     pthread_create(&app.rx_tid, NULL, recv_thread_func, NULL);
+
+    queue_server_history(args->host, args->port);
 
     char *host_info = g_strdup_printf("%s:%d", args->host, args->port);
     g_idle_add(ui_connect_ok, host_info);
@@ -906,6 +1203,7 @@ static void *signup_thread_func(void *data)
     g_print("[SIGNUP] Received response, frame type: %d\n", f.type);
 
     if (f.type == MSG_TYPE_REG_OK) {
+        queue_server_history(args->host, args->port);
         g_idle_add(ui_connect_success, g_strdup("Sign up successful! Please connect."));
     } else {
         /* Decode error message if any */
@@ -1291,6 +1589,24 @@ static gboolean ui_on_message(gpointer data)
 
     if (d->type == UI_MSG_USERLIST) {
         update_user_list(d->text);
+    } else if (d->type == UI_MSG_PASSWD_OK) {
+        if (app.has_pending_password_hash) {
+            memcpy(app.current_password_hash,
+                   app.pending_password_hash,
+                   SHA256_DIGEST_SIZE);
+            app.has_password_hash = 1;
+            app.has_pending_password_hash = 0;
+            memset(app.pending_password_hash, 0,
+                   sizeof(app.pending_password_hash));
+        }
+        show_message_dialog(GTK_MESSAGE_INFO, d->text);
+        append_chat_text(d->text, UI_MSG_SYSTEM);
+    } else if (d->type == UI_MSG_PASSWD_FAIL) {
+        app.has_pending_password_hash = 0;
+        memset(app.pending_password_hash, 0,
+               sizeof(app.pending_password_hash));
+        show_message_dialog(GTK_MESSAGE_WARNING, d->text);
+        append_chat_text(d->text, UI_MSG_ERROR);
     } else {
         append_chat_text(d->text, d->type);
     }
@@ -1355,8 +1671,14 @@ static gboolean ui_connect_ok(gpointer data)
 
     gtk_widget_set_sensitive(app.msg_entry, TRUE);
     gtk_widget_set_sensitive(app.send_btn, TRUE);
-    if (app.logout_btn)
+    if (app.change_pass_btn) {
+        gtk_widget_show(app.change_pass_btn);
+        gtk_widget_set_sensitive(app.change_pass_btn, TRUE);
+    }
+    if (app.logout_btn) {
+        gtk_widget_show(app.logout_btn);
         gtk_widget_set_sensitive(app.logout_btn, TRUE);
+    }
     gtk_widget_grab_focus(app.msg_entry);
 
     append_chat_text("Connected. All messages are encrypted with AES-256-CBC.",
@@ -1550,6 +1872,192 @@ static void on_clear_pm(GtkWidget *w, gpointer data)
     gtk_widget_hide(app.recipient_bar);
 }
 
+static void on_change_password_clicked(GtkWidget *w, gpointer data)
+{
+    (void)w;
+    (void)data;
+
+    GtkWidget *dialog = gtk_dialog_new_with_buttons(
+        "Change Password",
+        GTK_WINDOW(app.window),
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "Cancel", GTK_RESPONSE_CANCEL,
+        "Change", GTK_RESPONSE_OK,
+        NULL);
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+    GtkWidget *grid = gtk_grid_new();
+    GtkWidget *old_entry = gtk_entry_new();
+    GtkWidget *new_entry = gtk_entry_new();
+    GtkWidget *confirm_entry = gtk_entry_new();
+    struct passwd_change_payload pp;
+
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 10);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
+    gtk_container_set_border_width(GTK_CONTAINER(grid), 12);
+
+    gtk_entry_set_visibility(GTK_ENTRY(old_entry), FALSE);
+    gtk_entry_set_visibility(GTK_ENTRY(new_entry), FALSE);
+    gtk_entry_set_visibility(GTK_ENTRY(confirm_entry), FALSE);
+    gtk_entry_set_input_purpose(GTK_ENTRY(old_entry), GTK_INPUT_PURPOSE_PASSWORD);
+    gtk_entry_set_input_purpose(GTK_ENTRY(new_entry), GTK_INPUT_PURPOSE_PASSWORD);
+    gtk_entry_set_input_purpose(GTK_ENTRY(confirm_entry), GTK_INPUT_PURPOSE_PASSWORD);
+
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Old Password"), 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), old_entry, 1, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("New Password"), 0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), new_entry, 1, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), gtk_label_new("Retype New Password"), 0, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid), confirm_entry, 1, 2, 1, 1);
+
+    gtk_box_pack_start(GTK_BOX(content), grid, TRUE, TRUE, 0);
+    gtk_widget_show_all(content);
+
+    while (1) {
+        int resp = gtk_dialog_run(GTK_DIALOG(dialog));
+        const char *old_pass;
+        const char *new_pass;
+        const char *confirm_pass;
+        uint8_t old_hash[SHA256_DIGEST_SIZE];
+        uint8_t new_hash[SHA256_DIGEST_SIZE];
+
+        if (resp != GTK_RESPONSE_OK)
+            break;
+
+        old_pass = gtk_entry_get_text(GTK_ENTRY(old_entry));
+        new_pass = gtk_entry_get_text(GTK_ENTRY(new_entry));
+        confirm_pass = gtk_entry_get_text(GTK_ENTRY(confirm_entry));
+
+        /* FIRST: Check old password is provided */
+        if (!old_pass[0]) {
+            GtkWidget *warn_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(dialog),
+                GTK_DIALOG_MODAL,
+                GTK_MESSAGE_WARNING,
+                GTK_BUTTONS_OK,
+                "Please enter your old password.");
+            gtk_dialog_run(GTK_DIALOG(warn_dialog));
+            gtk_widget_destroy(warn_dialog);
+            continue;
+        }
+
+        /* FIRST (continued): Verify old password correctness before new-password checks */
+        if (!app.has_password_hash) {
+            GtkWidget *warn_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(dialog),
+                GTK_DIALOG_MODAL,
+                GTK_MESSAGE_WARNING,
+                GTK_BUTTONS_OK,
+                "Cannot verify old password right now. Please reconnect and try again.");
+            gtk_dialog_run(GTK_DIALOG(warn_dialog));
+            gtk_widget_destroy(warn_dialog);
+            continue;
+        }
+
+        if (crypto_sha256(&app.crypto,
+                          (const uint8_t *)old_pass, (uint32_t)strlen(old_pass),
+                          old_hash) < 0) {
+            GtkWidget *err_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(dialog),
+                GTK_DIALOG_MODAL,
+                GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_OK,
+                "Cannot hash old password via crypto driver.");
+            gtk_dialog_run(GTK_DIALOG(err_dialog));
+            gtk_widget_destroy(err_dialog);
+            continue;
+        }
+
+        if (memcmp(old_hash, app.current_password_hash, SHA256_DIGEST_SIZE) != 0) {
+            GtkWidget *warn_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(dialog),
+                GTK_DIALOG_MODAL,
+                GTK_MESSAGE_WARNING,
+                GTK_BUTTONS_OK,
+                "Old password is incorrect.");
+            gtk_dialog_run(GTK_DIALOG(warn_dialog));
+            gtk_widget_destroy(warn_dialog);
+            gtk_widget_grab_focus(old_entry);
+            continue;
+        }
+
+        /* SECOND: Check new passwords are provided and match */
+        if (!new_pass[0] || !confirm_pass[0]) {
+            GtkWidget *warn_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(dialog),
+                GTK_DIALOG_MODAL,
+                GTK_MESSAGE_WARNING,
+                GTK_BUTTONS_OK,
+                "Please enter both new password fields.");
+            gtk_dialog_run(GTK_DIALOG(warn_dialog));
+            gtk_widget_destroy(warn_dialog);
+            continue;
+        }
+
+        if (strcmp(new_pass, confirm_pass) != 0) {
+            GtkWidget *warn_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(dialog),
+                GTK_DIALOG_MODAL,
+                GTK_MESSAGE_WARNING,
+                GTK_BUTTONS_OK,
+                "New password and retype password are different.");
+            gtk_dialog_run(GTK_DIALOG(warn_dialog));
+            gtk_widget_destroy(warn_dialog);
+            continue;
+        }
+
+        if (!app.connected) {
+            GtkWidget *warn_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(dialog),
+                GTK_DIALOG_MODAL,
+                GTK_MESSAGE_WARNING,
+                GTK_BUTTONS_OK,
+                "You must be connected before changing password.");
+            gtk_dialog_run(GTK_DIALOG(warn_dialog));
+            gtk_widget_destroy(warn_dialog);
+            break;
+        }
+
+        /* Hash new password only after old password has passed validation */
+        memset(&pp, 0, sizeof(pp));
+        if (crypto_sha256(&app.crypto,
+                          (const uint8_t *)new_pass, (uint32_t)strlen(new_pass),
+                          new_hash) < 0) {
+            GtkWidget *err_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(dialog),
+                GTK_DIALOG_MODAL,
+                GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_OK,
+                "Cannot hash new password via crypto driver.");
+            gtk_dialog_run(GTK_DIALOG(err_dialog));
+            gtk_widget_destroy(err_dialog);
+            break;
+        }
+
+        memcpy(pp.old_password_hash, old_hash, SHA256_DIGEST_SIZE);
+        memcpy(pp.new_password_hash, new_hash, SHA256_DIGEST_SIZE);
+
+        if (send_command(MSG_TYPE_PASSWD_CHANGE_REQ, &pp, sizeof(pp)) < 0) {
+            GtkWidget *err_dialog = gtk_message_dialog_new(
+                GTK_WINDOW(dialog),
+                GTK_DIALOG_MODAL,
+                GTK_MESSAGE_ERROR,
+                GTK_BUTTONS_OK,
+                "Cannot send password-change request.");
+            gtk_dialog_run(GTK_DIALOG(err_dialog));
+            gtk_widget_destroy(err_dialog);
+            break;
+        }
+
+        memcpy(app.pending_password_hash, new_hash, SHA256_DIGEST_SIZE);
+        app.has_pending_password_hash = 1;
+
+        append_chat_text("Password change request sent...", UI_MSG_SYSTEM);
+        break;
+    }
+
+    gtk_widget_destroy(dialog);
+}
+
 /**
  * on_list_timer - Callback timer định kỳ (mỗi LIST_INTERVAL_SEC giây).
  *
@@ -1574,6 +2082,10 @@ static void perform_logout(gboolean notify_server, const char *login_msg)
         send_command(MSG_TYPE_LOGOUT, "bye", 3);
 
     app.connected = 0;
+    app.has_password_hash = 0;
+    app.has_pending_password_hash = 0;
+    memset(app.current_password_hash, 0, sizeof(app.current_password_hash));
+    memset(app.pending_password_hash, 0, sizeof(app.pending_password_hash));
 
     if (app.sock >= 0) {
         shutdown(app.sock, SHUT_RDWR);
@@ -1588,8 +2100,14 @@ static void perform_logout(gboolean notify_server, const char *login_msg)
 
     gtk_widget_set_sensitive(app.msg_entry, FALSE);
     gtk_widget_set_sensitive(app.send_btn, FALSE);
-    if (app.logout_btn)
+    if (app.change_pass_btn) {
+        gtk_widget_set_sensitive(app.change_pass_btn, FALSE);
+        gtk_widget_hide(app.change_pass_btn);
+    }
+    if (app.logout_btn) {
         gtk_widget_set_sensitive(app.logout_btn, FALSE);
+        gtk_widget_hide(app.logout_btn);
+    }
     gtk_widget_hide(app.recipient_bar);
     gtk_entry_set_text(GTK_ENTRY(app.msg_entry), "");
 
@@ -1742,6 +2260,8 @@ static GtkWidget *build_login_page(void)
                      G_CALLBACK(on_connect_clicked), NULL);
     gtk_widget_set_hexpand(app.pass_entry, TRUE);
     gtk_grid_attach(GTK_GRID(grid), app.pass_entry, 0, 5, 2, 1);
+
+    load_server_history();
 
     gtk_box_pack_start(GTK_BOX(card), grid, FALSE, FALSE, 0);
 
@@ -1996,8 +2516,18 @@ int main(int argc, char *argv[])
                                 "Secure Chat Application");
     gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(app.header_bar), TRUE);
 
+    app.change_pass_btn = gtk_button_new_with_label("Change Password");
+    gtk_widget_set_sensitive(app.change_pass_btn, FALSE);
+    gtk_widget_set_no_show_all(app.change_pass_btn, TRUE);
+    gtk_widget_hide(app.change_pass_btn);
+    g_signal_connect(app.change_pass_btn, "clicked",
+                     G_CALLBACK(on_change_password_clicked), NULL);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(app.header_bar), app.change_pass_btn);
+
     app.logout_btn = gtk_button_new_with_label("Logout");
     gtk_widget_set_sensitive(app.logout_btn, FALSE);
+    gtk_widget_set_no_show_all(app.logout_btn, TRUE);
+    gtk_widget_hide(app.logout_btn);
     g_signal_connect(app.logout_btn, "clicked",
                      G_CALLBACK(on_logout_clicked), NULL);
     gtk_header_bar_pack_end(GTK_HEADER_BAR(app.header_bar), app.logout_btn);
@@ -2021,10 +2551,7 @@ int main(int argc, char *argv[])
     gtk_container_add(GTK_CONTAINER(app.window), app.stack);
 
     /* Điền trước host/port từ tham số dòng lệnh */
-    if (argc >= 2)
-        gtk_entry_set_text(GTK_ENTRY(app.host_entry), argv[1]);
-    if (argc >= 3)
-        gtk_entry_set_text(GTK_ENTRY(app.port_entry), argv[2]);
+    apply_startup_server_defaults(argc, argv);
 
     /* Timer định kỳ làm mới danh sách người dùng */
     app.list_timer_id = g_timeout_add_seconds(LIST_INTERVAL_SEC,

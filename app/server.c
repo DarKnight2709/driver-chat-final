@@ -77,6 +77,8 @@ static int   user_db_verify(const char *uname,
                             const uint8_t *pwd_hash);
 static int   user_db_add  (const char *uname,
                             const uint8_t *pwd_hash);
+static int   user_db_update_password(const char *uname,
+                            const uint8_t *new_pwd_hash);
 static int   add_user_db_plain(crypto_ctx_t *ctx,
                             const char *uname, const char *pwd);
 
@@ -360,6 +362,48 @@ static void list_users(client_state_t *c)
     send_frame(c, MSG_TYPE_SYSTEM, buf, (uint16_t)strlen(buf));
 }
 
+static void handle_password_change(client_state_t *c,
+                                   const struct chat_frame *f)
+{
+    struct passwd_change_payload pp;
+    uint32_t plain_len = 0;
+
+    if (crypto_aes_decrypt(&c->crypto,
+                           c->session_key, f->iv,
+                           f->payload, f->payload_len,
+                           (uint8_t *)&pp, &plain_len) < 0) {
+        send_frame(c, MSG_TYPE_PASSWD_CHANGE_FAIL,
+                   "Cannot decode password-change request",
+                   (uint16_t)strlen("Cannot decode password-change request"));
+        return;
+    }
+
+    if (plain_len < sizeof(pp)) {
+        send_frame(c, MSG_TYPE_PASSWD_CHANGE_FAIL,
+                   "Invalid password-change payload",
+                   (uint16_t)strlen("Invalid password-change payload"));
+        return;
+    }
+
+    if (!user_db_verify(c->username, pp.old_password_hash)) {
+        send_frame(c, MSG_TYPE_PASSWD_CHANGE_FAIL,
+                   "Old password is incorrect",
+                   (uint16_t)strlen("Old password is incorrect"));
+        return;
+    }
+
+    if (user_db_update_password(c->username, pp.new_password_hash) < 0) {
+        send_frame(c, MSG_TYPE_PASSWD_CHANGE_FAIL,
+                   "Cannot update password in database",
+                   (uint16_t)strlen("Cannot update password in database"));
+        return;
+    }
+
+    send_frame(c, MSG_TYPE_PASSWD_CHANGE_OK,
+               "Password changed successfully",
+               (uint16_t)strlen("Password changed successfully"));
+}
+
 /* ── Per-client thread ───────────────────────────────────── */
 /*
  * client_thread - hàm chạy trong luồng xử lý cho từng client.
@@ -511,6 +555,10 @@ static void *client_thread(void *arg)
 
         case MSG_TYPE_LIST:
             list_users(c);
+            break;
+
+        case MSG_TYPE_PASSWD_CHANGE_REQ:
+            handle_password_change(c, &f);
             break;
 
         case MSG_TYPE_LOGOUT:
@@ -695,6 +743,51 @@ static int user_db_add(const char *uname, const uint8_t *pwd_hash)
     if (rc == SQLITE_CONSTRAINT || rc == SQLITE_CONSTRAINT_PRIMARYKEY)
         return 1;
     return -1;
+}
+
+static int user_db_update_password(const char *uname,
+                                   const uint8_t *new_pwd_hash)
+{
+    sqlite3_stmt *stmt = NULL;
+    int rc;
+
+    if (!uname || !new_pwd_hash) return -1;
+
+    pthread_mutex_lock(&db_mutex);
+    if (!g_user_db) {
+        pthread_mutex_unlock(&db_mutex);
+        return -1;
+    }
+
+    rc = sqlite3_prepare_v2(g_user_db,
+                            "UPDATE users SET password_hash = ?1 "
+                            "WHERE username = ?2;",
+                            -1, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        pthread_mutex_unlock(&db_mutex);
+        return -1;
+    }
+
+    sqlite3_bind_blob(stmt, 1, new_pwd_hash, SHA256_DIGEST_SIZE,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, uname, -1, SQLITE_TRANSIENT);
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        return -1;
+    }
+
+    if (sqlite3_changes(g_user_db) <= 0) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&db_mutex);
+        return -1;
+    }
+
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&db_mutex);
+    return 0;
 }
 
 /* Helper to add user with clear-text password (for initial seed) */
