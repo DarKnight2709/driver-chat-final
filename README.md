@@ -122,6 +122,7 @@ make gui_client
 
 **Tính năng GUI:**
 - Giao diện login đầy đủ (server, port, username, password)
+- Tự nhớ các server IP và port đã dùng gần nhất, gợi ý ngay khi đang nhập
 - Dark theme hiện đại (Catppuccin palette)
 - Danh sách online users (sidebar, tự động refresh)
 - Tin nhắn riêng tư: double-click tên user để gửi PM

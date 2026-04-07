@@ -80,6 +80,9 @@ struct crypto_kdf_req {
 #define MSG_TYPE_REGISTER  0x09   /* register new user        */
 #define MSG_TYPE_REG_OK    0x0A   /* registration success     */
 #define MSG_TYPE_REG_FAIL  0x0B   /* registration failed      */
+#define MSG_TYPE_PASSWD_CHANGE_REQ  0x0C /* change password request */
+#define MSG_TYPE_PASSWD_CHANGE_OK   0x0D /* password changed        */
+#define MSG_TYPE_PASSWD_CHANGE_FAIL 0x0E /* change password failed  */
 
 /* Fixed-size wire frame (simplifies framing) */
 struct chat_frame {
@@ -103,6 +106,12 @@ struct chat_payload {
     char recipient[MAX_USERNAME_LEN];   /* empty = broadcast         */
     char message[MAX_MSG_LEN];
     __u64 timestamp;
+} __attribute__((packed));
+
+/* Password change payload (sent after authenticated session is established) */
+struct passwd_change_payload {
+    __u8 old_password_hash[SHA256_DIGEST_SIZE];
+    __u8 new_password_hash[SHA256_DIGEST_SIZE];
 } __attribute__((packed));
 
 #endif /* CRYPTO_CHAT_H */

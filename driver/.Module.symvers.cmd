@@ -1,1 +1,0 @@
-savedcmd_/root/driver-chat-final/driver/Module.symvers :=  scripts/mod/modpost -M -m -a      -o /root/driver-chat-final/driver/Module.symvers -n -T /root/driver-chat-final/driver/modules.order -i Module.symvers -e 
