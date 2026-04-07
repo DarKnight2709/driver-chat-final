@@ -266,6 +266,11 @@ static int authenticate_with_frame(client_state_t *c, struct chat_frame *fixed_f
 
     if (plain_len < sizeof(struct auth_payload)) return -1;
 
+    /* Ensure decrypted username is always a bounded C string. */
+    ap.username[MAX_USERNAME_LEN - 1] = '\0';
+    if (ap.username[0] == '\0')
+        return -1;
+
     auth_ok = user_db_verify(ap.username, ap.password_hash);
     if (auth_ok <= 0) {
         /* Auth failed — use zero key to send rejection */
@@ -645,8 +650,8 @@ static int user_db_verify(const char *uname, const uint8_t *pwd_hash)
         return 0;
     }
 
-    sqlite3_bind_text(stmt, 1, uname, -1, SQLITE_STATIC);
-    sqlite3_bind_blob(stmt, 2, pwd_hash, SHA256_DIGEST_SIZE, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, uname, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 2, pwd_hash, SHA256_DIGEST_SIZE, SQLITE_TRANSIENT);
 
     rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) found = 1;
@@ -679,8 +684,8 @@ static int user_db_add(const char *uname, const uint8_t *pwd_hash)
         return -1;
     }
 
-    sqlite3_bind_text(stmt, 1, uname, -1, SQLITE_STATIC);
-    sqlite3_bind_blob(stmt, 2, pwd_hash, SHA256_DIGEST_SIZE, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 1, uname, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_blob(stmt, 2, pwd_hash, SHA256_DIGEST_SIZE, SQLITE_TRANSIENT);
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);

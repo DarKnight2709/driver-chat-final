@@ -118,6 +118,7 @@ static gboolean ui_on_message(gpointer data);
 static gboolean ui_on_disconnect(gpointer data);
 static gboolean ui_connect_ok(gpointer data);
 static gboolean ui_connect_fail(gpointer data);
+static gboolean ui_connect_success(gpointer data);
 
 /* ── CSS theme ─────────────────────────────────────────────
  *
@@ -399,6 +400,7 @@ static const char *APP_CSS =
 
     /* === Nhãn lỗi === */
     ".error-status { color: #f47067; }\n"
+    ".success-status { color: #4ec97e; }\n"
 
     /* === Dải phân cách === */
     "separator { background-color: #2e3855; min-height: 1px; min-width: 1px; }\n"
@@ -869,7 +871,17 @@ static void *signup_thread_func(void *data)
     memset(&ap, 0, sizeof(ap));
     snprintf(ap.username, sizeof(ap.username), "%s", args->username);
     g_print("[SIGNUP] Hashing password\n");
-    crypto_sha256(&app.crypto, (uint8_t *)args->password, strlen(args->password), ap.password_hash);
+    if (crypto_sha256(&app.crypto,
+                      (const uint8_t *)args->password,
+                      (uint32_t)strlen(args->password),
+                      ap.password_hash) < 0) {
+        close(app.sock);
+        crypto_close(&app.crypto);
+        g_print("[SIGNUP] crypto_sha256 failed\n");
+        g_idle_add(ui_connect_fail, g_strdup("Password hashing failed"));
+        g_free(args);
+        return NULL;
+    }
 
     memcpy(app.session_key, zero_key, AES_KEY_SIZE);
     g_print("[SIGNUP] About to send MSG_TYPE_REGISTER (type=%d) with payload size %zu\n", 
@@ -892,12 +904,22 @@ static void *signup_thread_func(void *data)
     g_print("[SIGNUP] Received response, frame type: %d\n", f.type);
 
     if (f.type == MSG_TYPE_REG_OK) {
-        g_idle_add(ui_connect_fail, g_strdup("Sign up successful! Please connect."));
+        g_idle_add(ui_connect_success, g_strdup("Sign up successful! Please connect."));
     } else {
         /* Decode error message if any */
         uint32_t plen = 0;
         uint8_t plain[MAX_DATA_SIZE];
-        crypto_aes_decrypt(&app.crypto, zero_key, f.iv, f.payload, f.payload_len, plain, &plen);
+        if (crypto_aes_decrypt(&app.crypto, zero_key, f.iv,
+                               f.payload, f.payload_len,
+                               plain, &plen) < 0) {
+            g_idle_add(ui_connect_fail,
+                       g_strdup("Sign up failed (cannot decode server response)"));
+            close(app.sock);
+            crypto_close(&app.crypto);
+            g_free(args);
+            return NULL;
+        }
+        if (plen >= MAX_DATA_SIZE) plen = MAX_DATA_SIZE - 1;
         plain[plen] = '\0';
         g_idle_add(ui_connect_fail, g_strdup_printf("Sign up failed: %s", (char*)plain));
     }
@@ -918,9 +940,17 @@ static void on_signup_clicked(GtkWidget *w, gpointer data)
 
     if (!user[0] || !pass[0]) {
         gtk_label_set_text(GTK_LABEL(app.login_status), "Username and password required");
+        gtk_style_context_remove_class(
+            gtk_widget_get_style_context(app.login_status), "success-status");
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(app.login_status), "error-status");
         return;
     }
 
+    gtk_style_context_remove_class(
+        gtk_widget_get_style_context(app.login_status), "error-status");
+    gtk_style_context_remove_class(
+        gtk_widget_get_style_context(app.login_status), "success-status");
     gtk_widget_set_sensitive(app.connect_btn, FALSE);
     gtk_widget_set_sensitive(app.signup_btn, FALSE);
     gtk_spinner_start(GTK_SPINNER(app.login_spinner));
@@ -1350,9 +1380,28 @@ static gboolean ui_connect_ok(gpointer data)
 static gboolean ui_connect_fail(gpointer data)
 {
     char *msg = data;
+    gtk_style_context_remove_class(
+        gtk_widget_get_style_context(app.login_status), "success-status");
     gtk_label_set_text(GTK_LABEL(app.login_status), msg);
     gtk_style_context_add_class(
         gtk_widget_get_style_context(app.login_status), "error-status");
+
+    gtk_widget_set_sensitive(app.connect_btn, TRUE);
+    gtk_widget_set_sensitive(app.signup_btn, TRUE);
+    gtk_spinner_stop(GTK_SPINNER(app.login_spinner));
+
+    g_free(msg);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean ui_connect_success(gpointer data)
+{
+    char *msg = data;
+    gtk_style_context_remove_class(
+        gtk_widget_get_style_context(app.login_status), "error-status");
+    gtk_label_set_text(GTK_LABEL(app.login_status), msg);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(app.login_status), "success-status");
 
     gtk_widget_set_sensitive(app.connect_btn, TRUE);
     gtk_widget_set_sensitive(app.signup_btn, TRUE);
@@ -1391,6 +1440,8 @@ static void on_connect_clicked(GtkWidget *w, gpointer data)
     if (!user[0] || !pass[0]) {
         gtk_label_set_text(GTK_LABEL(app.login_status),
                            "Username and password are required");
+        gtk_style_context_remove_class(
+            gtk_widget_get_style_context(app.login_status), "success-status");
         gtk_style_context_add_class(
             gtk_widget_get_style_context(app.login_status), "error-status");
         return;
@@ -1398,6 +1449,8 @@ static void on_connect_clicked(GtkWidget *w, gpointer data)
 
     gtk_style_context_remove_class(
         gtk_widget_get_style_context(app.login_status), "error-status");
+    gtk_style_context_remove_class(
+        gtk_widget_get_style_context(app.login_status), "success-status");
     gtk_widget_set_sensitive(app.connect_btn, FALSE);
     gtk_spinner_start(GTK_SPINNER(app.login_spinner));
     gtk_label_set_text(GTK_LABEL(app.login_status), "Connecting...");
