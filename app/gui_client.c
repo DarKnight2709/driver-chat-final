@@ -65,6 +65,7 @@ typedef struct {
 
     /* Trang chat */
     GtkWidget    *header_bar;
+    GtkWidget    *logout_btn;
     GtkWidget    *chat_view;
     GtkTextBuffer*chat_buf;
     GtkTextMark  *end_mark;
@@ -119,6 +120,7 @@ static gboolean ui_on_disconnect(gpointer data);
 static gboolean ui_connect_ok(gpointer data);
 static gboolean ui_connect_fail(gpointer data);
 static gboolean ui_connect_success(gpointer data);
+static void perform_logout(gboolean notify_server, const char *login_msg);
 
 /* ── CSS theme ─────────────────────────────────────────────
  *
@@ -1018,11 +1020,7 @@ static void on_send_clicked(GtkWidget *w, gpointer data)
     if (strncmp(text, "/list", 5) == 0) {
         send_command(MSG_TYPE_LIST, "", 0);
     } else if (strncmp(text, "/quit", 5) == 0) {
-        send_command(MSG_TYPE_LOGOUT, "bye", 3);
-        app.connected = 0;
-        append_chat_text("Disconnected by user.", UI_MSG_SYSTEM);
-        gtk_widget_set_sensitive(app.msg_entry, FALSE);
-        gtk_widget_set_sensitive(app.send_btn, FALSE);
+        perform_logout(TRUE, "Logged out. Please sign in again.");
     } else if (strncmp(text, "/msg ", 5) == 0) {
         const char *rest = text + 5;
         const char *sp = strchr(rest, ' ');
@@ -1357,6 +1355,8 @@ static gboolean ui_connect_ok(gpointer data)
 
     gtk_widget_set_sensitive(app.msg_entry, TRUE);
     gtk_widget_set_sensitive(app.send_btn, TRUE);
+    if (app.logout_btn)
+        gtk_widget_set_sensitive(app.logout_btn, TRUE);
     gtk_widget_grab_focus(app.msg_entry);
 
     append_chat_text("Connected. All messages are encrypted with AES-256-CBC.",
@@ -1568,6 +1568,64 @@ static gboolean on_list_timer(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
+static void perform_logout(gboolean notify_server, const char *login_msg)
+{
+    if (app.connected && notify_server)
+        send_command(MSG_TYPE_LOGOUT, "bye", 3);
+
+    app.connected = 0;
+
+    if (app.sock >= 0) {
+        shutdown(app.sock, SHUT_RDWR);
+        close(app.sock);
+        app.sock = -1;
+    }
+
+    crypto_close(&app.crypto);
+    memset(app.session_key, 0, sizeof(app.session_key));
+    memset(app.username, 0, sizeof(app.username));
+    memset(app.recipient, 0, sizeof(app.recipient));
+
+    gtk_widget_set_sensitive(app.msg_entry, FALSE);
+    gtk_widget_set_sensitive(app.send_btn, FALSE);
+    if (app.logout_btn)
+        gtk_widget_set_sensitive(app.logout_btn, FALSE);
+    gtk_widget_hide(app.recipient_bar);
+    gtk_entry_set_text(GTK_ENTRY(app.msg_entry), "");
+
+    GList *children = gtk_container_get_children(GTK_CONTAINER(app.user_list));
+    for (GList *l = children; l; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(children);
+
+    gtk_label_set_text(GTK_LABEL(app.status_label), "  Disconnected");
+    gtk_header_bar_set_title(GTK_HEADER_BAR(app.header_bar), "CryptoChat");
+    gtk_header_bar_set_subtitle(GTK_HEADER_BAR(app.header_bar),
+                                "Secure Chat Application");
+
+    if (login_msg) {
+        gtk_style_context_remove_class(
+            gtk_widget_get_style_context(app.login_status), "error-status");
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(app.login_status), "success-status");
+        gtk_label_set_text(GTK_LABEL(app.login_status), login_msg);
+    }
+
+    gtk_spinner_stop(GTK_SPINNER(app.login_spinner));
+    gtk_widget_set_sensitive(app.connect_btn, TRUE);
+    gtk_widget_set_sensitive(app.signup_btn, TRUE);
+
+    gtk_stack_set_visible_child_name(GTK_STACK(app.stack), "login");
+    gtk_widget_grab_focus(app.user_entry);
+}
+
+static void on_logout_clicked(GtkWidget *w, gpointer data)
+{
+    (void)w;
+    (void)data;
+    perform_logout(TRUE, "Logged out. Please sign in again.");
+}
+
 /**
  * on_window_destroy - Handler khi cửa sổ GUI bị đóng.
  *
@@ -1592,18 +1650,7 @@ static void on_window_destroy(GtkWidget *w, gpointer data)
         app.list_timer_id = 0;
     }
 
-    if (app.connected) {
-        app.connected = 0;
-        send_command(MSG_TYPE_LOGOUT, "bye", 3);
-    }
-
-    if (app.sock >= 0) {
-        shutdown(app.sock, SHUT_RDWR);
-        close(app.sock);
-        app.sock = -1;
-    }
-
-    crypto_close(&app.crypto);
+    perform_logout(TRUE, NULL);
     gtk_main_quit();
 }
 
@@ -1948,6 +1995,12 @@ int main(int argc, char *argv[])
     gtk_header_bar_set_subtitle(GTK_HEADER_BAR(app.header_bar),
                                 "Secure Chat Application");
     gtk_header_bar_set_show_close_button(GTK_HEADER_BAR(app.header_bar), TRUE);
+
+    app.logout_btn = gtk_button_new_with_label("Logout");
+    gtk_widget_set_sensitive(app.logout_btn, FALSE);
+    g_signal_connect(app.logout_btn, "clicked",
+                     G_CALLBACK(on_logout_clicked), NULL);
+    gtk_header_bar_pack_end(GTK_HEADER_BAR(app.header_bar), app.logout_btn);
 
     /* Cửa sổ chính */
     app.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
