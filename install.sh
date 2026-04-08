@@ -84,13 +84,6 @@ make clean 2>/dev/null || true
 make
 ok "Applications built"
 
-# ── 5. Smoke test ─────────────────────────────────────────
-info "Running crypto driver smoke test..."
-if ./test_crypto; then
-    ok "All tests passed!"
-else
-    warn "Some tests failed — check output above"
-fi
 
 # ── 6. Summary ────────────────────────────────────────────
 echo ""

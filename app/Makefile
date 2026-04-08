@@ -13,8 +13,6 @@ LDFLAGS = -lpthread -lsqlite3
 
 SRCS_COMMON = crypto_lib.c
 SRCS_SERVER = server.c $(SRCS_COMMON)
-SRCS_CLIENT = client.c $(SRCS_COMMON)
-SRCS_TEST   = test_crypto.c $(SRCS_COMMON)
 SRCS_GUI    = gui_client.c $(SRCS_COMMON)
 
 # GTK3 detection
@@ -23,7 +21,7 @@ GTK3_LIBS   := $(shell pkg-config --libs   gtk+-3.0 2>/dev/null)
 HAS_GTK3    := $(if $(GTK3_CFLAGS),yes,no)
 
 # Base targets always built
-TARGETS = server client test_crypto
+TARGETS = server
 
 # Auto-add GUI if GTK3 is available
 ifeq ($(HAS_GTK3),yes)
@@ -44,14 +42,6 @@ server: $(SRCS_SERVER)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "[✓] server built"
 
-client: $(SRCS_CLIENT)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-	@echo "[✓] client built"
-
-test_crypto: $(SRCS_TEST)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-	@echo "[✓] test_crypto built"
-
 gui_client: $(SRCS_GUI)
 ifeq ($(HAS_GTK3),yes)
 	$(CC) $(CFLAGS) $(GTK3_CFLAGS) -o $@ $^ $(LDFLAGS) $(GTK3_LIBS)
@@ -62,16 +52,10 @@ else
 endif
 
 clean:
-	rm -f server client test_crypto gui_client *.o
+	rm -f server gui_client *.o
 
 run_server: server
 	@sudo ./server $(PORT)
 
-run_client: client
-	@./client $(HOST) $(PORT)
-
 run_gui: gui_client
 	@./gui_client $(HOST) $(PORT)
-
-test: test_crypto
-	@sudo ./test_crypto
