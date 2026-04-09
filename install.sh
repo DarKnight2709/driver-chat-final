@@ -84,6 +84,12 @@ make clean 2>/dev/null || true
 make
 ok "Applications built"
 
+# ── 5. System Setup (Icon, Desktop Entry, Udev) ───────────
+info "Configuring system integration..."
+chmod +x setup_app.sh
+./setup_app.sh
+ok "System integration complete"
+
 
 # ── 6. Summary ────────────────────────────────────────────
 echo ""
@@ -92,13 +98,14 @@ echo -e "${BOLD}  CryptoChat Installation Complete!         ${NC}"
 echo -e "${BOLD}═══════════════════════════════════════════${NC}"
 echo ""
 echo "To start the server:"
-echo "  cd $SCRIPT_DIR/app && sudo ./server [port]"
+echo "  cd $SCRIPT_DIR/app && sudo ./chat_server [port]"
 echo ""
 echo "To start a client — Terminal:"
 echo "  cd $SCRIPT_DIR/app && ./client [server_ip] [port]"
 echo ""
-echo "To start a client — GUI (requires gtk3-devel):"
-echo "  cd $SCRIPT_DIR/app && ./gui_client [server_ip] [port]"
+echo "To start a client — GUI:"
+echo "  1. Find 'CryptoChat' in your system application menu (search for it)"
+echo "  2. Or run: cd $SCRIPT_DIR/app && ./gui_client [server_ip] [port]"
 echo ""
 echo "Default port: 9090"
 echo "Built-in accounts: alice/password123  bob/secret456"

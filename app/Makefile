@@ -8,12 +8,22 @@
 # =============================================================================
 
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -g -I../driver
+CFLAGS  = -Wall -Wextra -O2 -g -I../driver -I. -Iclient/include
 LDFLAGS = -lpthread -lsqlite3
 
 SRCS_COMMON = crypto_lib.c
-SRCS_SERVER = server.c $(SRCS_COMMON)
-SRCS_GUI    = gui_client.c $(SRCS_COMMON)
+SRCS_SERVER = server/server.c \
+	server/core/chat_logic.c \
+	server/protocol/frame.c \
+	server/db/user_db.c \
+	$(SRCS_COMMON)
+SRCS_GUI    = client/src/main.c \
+	client/src/gui.c \
+	client/src/ui_callbacks.c \
+	client/src/network.c \
+	client/src/history.c \
+	client/src/utils.c \
+	$(SRCS_COMMON)
 
 # GTK3 detection
 GTK3_CFLAGS := $(shell pkg-config --cflags gtk+-3.0 2>/dev/null)
@@ -21,7 +31,7 @@ GTK3_LIBS   := $(shell pkg-config --libs   gtk+-3.0 2>/dev/null)
 HAS_GTK3    := $(if $(GTK3_CFLAGS),yes,no)
 
 # Base targets always built
-TARGETS = server
+TARGETS = chat_server
 
 # Auto-add GUI if GTK3 is available
 ifeq ($(HAS_GTK3),yes)
@@ -38,9 +48,9 @@ else
 	@echo "[+] Core targets built (GUI skipped — install gtk3-devel for GUI)"
 endif
 
-server: $(SRCS_SERVER)
+chat_server: $(SRCS_SERVER)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-	@echo "[✓] server built"
+	@echo "[✓] chat_server built"
 
 gui_client: $(SRCS_GUI)
 ifeq ($(HAS_GTK3),yes)
@@ -52,10 +62,10 @@ else
 endif
 
 clean:
-	rm -f server gui_client *.o
+	rm -f chat_server gui_client *.o
 
-run_server: server
-	@sudo ./server $(PORT)
+run_server: chat_server
+	@sudo ./chat_server $(PORT)
 
 run_gui: gui_client
 	@./gui_client $(HOST) $(PORT)

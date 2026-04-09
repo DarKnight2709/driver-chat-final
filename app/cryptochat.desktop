@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=CryptoChat
+Comment=Secure Encrypted Chat Application
+Exec=/usr/local/bin/cryptochat-launcher
+Icon=cryptochat
+Terminal=false
+Type=Application
+Categories=Network;Chat;InstantMessaging;
+Keywords=chat;crypto;secure;
